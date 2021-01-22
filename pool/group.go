@@ -9,6 +9,7 @@ type Group struct {
 	Name        string             // 组名
 	workerCount int                // 工人数
 	Pool        *Pool              // 工作组
+	Status      bool               // 运行状态
 	StopFunc    context.CancelFunc // 关闭工作组信号
 }
 
@@ -19,6 +20,7 @@ func AddNewGroup(name string, workerCount int) *Group {
 		workerCount: workerCount,
 		Pool:        p,
 		StopFunc:    cencel,
+		Status:      true,
 	}
 	return g
 }

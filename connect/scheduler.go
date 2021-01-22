@@ -2,6 +2,7 @@ package connect
 
 import (
 	"bullshit/common/logs"
+	"bullshit/pipeline"
 	"bullshit/pool"
 	"go.uber.org/zap"
 	"net/http"
@@ -14,9 +15,9 @@ type Scheduler struct {
 	SpiderList []SpiderBase  // 所有爬虫类型
 	Groups     []*pool.Group // 所有工作组
 
-	status                  status // 调度器状态
-	baseRequestsMiddlerware []RequestsMiddlerware
-	baseResponseMiddlerware []ResponseMiddlerware
+	Middlewares []Middleware
+	Pipeline    pipeline.Pipeline // 管道数据
+	status      status            // 调度器状态
 }
 
 // 获取一个调度器
@@ -28,12 +29,9 @@ func NewScheduler() *Scheduler {
 }
 
 // 添加基础共有中间件
-func (s *Scheduler) AddBaseMiddlerware(requM RequestsMiddlerware, respM ResponseMiddlerware) {
-	if requM != nil {
-		s.baseRequestsMiddlerware = append(s.baseRequestsMiddlerware, requM)
-	}
-	if respM != nil {
-		s.baseResponseMiddlerware = append(s.baseResponseMiddlerware, respM)
+func (s *Scheduler) AddBaseMiddlerware(m Middleware) {
+	if m.RespMiddleware != nil || m.RequMiddleware != nil {
+		s.Middlewares = append(s.Middlewares, m)
 	}
 }
 
@@ -42,7 +40,7 @@ func (s *Scheduler) AddSpider(spider SpiderBase) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	// 装载共有模块
-	spider.allBaseMiddlerware(s.baseRequestsMiddlerware, s.baseResponseMiddlerware)
+	spider.loadMiddlerwares(s.Middlewares)
 	s.SpiderList = append(s.SpiderList, spider)
 }
 
@@ -59,10 +57,13 @@ func (s *Scheduler) Excute() {
 	// 为每一个爬虫创建工作组, 添加任务执行到工作组
 	for _, spider := range s.SpiderList {
 		name, count := spider.spiderBase()
-		group := pool.AddNewGroup(name, count)
-		s.Groups = append(s.Groups, group)
-		go monitor(group, spider) // 处理新的请求
-		go process(group, spider) // 处理响应的请求
+		httpGroup := pool.AddNewGroup(name, count)
+		s.Groups = append(s.Groups, httpGroup)
+		go monitor(httpGroup, spider)             // 处理新的请求
+		go process(httpGroup, spider, s.Pipeline) // 处理响应的请求
+
+		StorageGroup := pool.AddNewGroup(name, count)
+		go storage(StorageGroup, s.Pipeline)
 	}
 	s.status = stop
 
@@ -77,7 +78,7 @@ func monitor(g *pool.Group, s SpiderBase) {
 	// 发请求
 	name, _ := s.spiderBase()
 	client, requQueue, respQueue := s.transportBase()
-	middlerwares, _ := s.getParse()
+	middlerwares := s.getMiddlerwares()
 
 	for {
 		if !SpiderStatus(g) {
@@ -90,15 +91,19 @@ func monitor(g *pool.Group, s SpiderBase) {
 
 		// 处理自定义中间件
 		for _, middlerware := range middlerwares {
-			err := middlerware(requ, nil)
-			if err != nil {
+			if middlerware.RequMiddleware == nil {
 				continue
+			}
+			err := middlerware.ProcessRequests(requ)
+			if err != nil {
+				logs.Logger.Error(g.Name, zap.Error(err))
+				return
 			}
 		}
 
 		// 值为nil，若中间件不处理
 		if requ == nil {
-			time.Sleep(NO_RESPONSE_DATA_SLEEP_TIME)
+			time.Sleep(NO_REQUESTS_DATA_SLEEP_TIME)
 		}
 
 		// 发送请求
@@ -111,14 +116,17 @@ func monitor(g *pool.Group, s SpiderBase) {
 		}
 	}
 
+	// todo 满足某些条件关闭 group 和 spider
+	//g.Status = false
 }
 
 // 处理该爬虫新的响应数据
-func process(g *pool.Group, s SpiderBase) {
+func process(g *pool.Group, s SpiderBase, p pipeline.Pipeline) {
 	// 处理请求
 	name, _ := s.spiderBase()
 	_, _, respList := s.transportBase()
-	middlerwares, parseFunc := s.getParse()
+	parseFunc := s.getParse()
+	middlerwares := s.getMiddlerwares()
 	for {
 		if !SpiderStatus(g) {
 			logs.Logger.Info(name + " is close")
@@ -130,9 +138,13 @@ func process(g *pool.Group, s SpiderBase) {
 
 		// 处理自定义中间件
 		for _, middlerware := range middlerwares {
-			err := middlerware(nil, resp)
-			if err != nil {
+			if middlerware.RespMiddleware == nil {
 				continue
+			}
+			err := middlerware.ProcessResponse(resp)
+			if err != nil {
+				logs.Logger.Error(g.Name, zap.Error(err))
+				return
 			}
 		}
 
@@ -144,12 +156,42 @@ func process(g *pool.Group, s SpiderBase) {
 		// 开始解析
 		t := &pool.Task{}
 		t.TaskFunc = doparse
-		t.Param = []interface{}{parseFunc, resp}
+		t.Param = []interface{}{parseFunc, resp, p}
 		err := g.Pool.Submit(t)
 		if err != nil {
 			logs.Logger.Error("g.Pool.Submit", zap.Error(err))
 		}
 	}
+
+	// todo 满足某些条件关闭 group 和 spider
+	//g.Status = false
+}
+
+// 存储新数据
+func storage(g *pool.Group, p pipeline.Pipeline) {
+	for {
+		if p.Empty() {
+			// todo 累计超过某一值
+			time.Sleep(NO_PIPELINE_DATA_SLEEP_TIME)
+			continue
+		}
+		t := &pool.Task{}
+		t.TaskFunc = func(i []interface{}) {
+			err := p.Save()
+			if err != nil {
+				logs.Logger.Error("storage.Save", zap.Error(err))
+			}
+			return
+		}
+		t.Param = []interface{}{}
+		err := g.Pool.Submit(t)
+		if err != nil {
+			logs.Logger.Error("g.Pool.Submit", zap.Error(err))
+		}
+	}
+
+	// todo 满足某些条件关闭 group 和 spider
+	//g.Status = false
 }
 
 func dohttp(params []interface{}) {
@@ -182,6 +224,11 @@ func dohttp(params []interface{}) {
 func doparse(params []interface{}) {
 	f := params[0].(ParseFunc)
 	r := params[1].(*Response)
+	p := params[2].(pipeline.Pipeline)
 
-	f(r)
+	// 处理得出的结果
+	result := f(r)
+
+	// 传输到通道保存
+	p.Push(result)
 }

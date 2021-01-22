@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -16,12 +17,14 @@ const (
 )
 
 type SpiderBase interface {
-	allBaseMiddlerware(requMiddlers []RequestsMiddlerware, respMiddlers []ResponseMiddlerware)
+	//allBaseMiddlerware(requMiddlers []RequestsMiddleware, respMiddlers []ResponseMiddleware)
 	spiderBase() (string, int)
 	transportBase() (*http.Client, RequQueue, RespQueue)
 	pushRequestToSche() RequQueue
 
-	getParse() ([]ResponseMiddlerware, ParseFunc)
+	loadMiddlerwares(ms []Middleware)
+	getMiddlerwares() []Middleware
+	getParse() ParseFunc
 }
 
 type Spider struct {
@@ -37,12 +40,11 @@ type Spider struct {
 	ConcurrentHttpCount  int // 并发请求数
 	ConcurrentParseCount int // 并发处理数
 
-	requestsMiddlewares []RequestsMiddlerware // 请求前
-	responseMiddlewares []ResponseMiddlerware // 响应后
-	ParseFunc           ParseFunc             // 解析方法
+	Middlewares []Middleware // 中间件
+	ParseFunc   ParseFunc    // 解析方法
 
-	lock   sync.RWMutex
-	status status
+	lock   sync.RWMutex // 同步操作
+	status status       // 爬虫状态
 }
 
 func NewSpider(name string) *Spider {
@@ -81,27 +83,40 @@ func (b *Spider) AddRequest(req *Requests) {
 	b.RequQueue.Push(req)
 }
 
-func (b *Spider) OnRequests(f RequestsMiddlerware) {
+func (b *Spider) OnRequests(f RequestsMiddleware) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+
+	if f == nil {
+		return
+	}
+	mName := fmt.Sprintf("%s-Requests", b.Name)
+	m := NewMiddleware(mName)
+	m.RequMiddleware = f
+	b.Middlewares = append(b.Middlewares, m)
+	//b.requestsMiddlewares = append(b.requestsMiddlewares, f)
+}
+
+func (b *Spider) OnResponse(f ResponseMiddleware) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 	if f == nil {
 		return
 	}
-	b.requestsMiddlewares = append(b.requestsMiddlewares, f)
+	mName := fmt.Sprintf("%s-Response", b.Name)
+	m := NewMiddleware(mName)
+	m.RespMiddleware = f
+	b.Middlewares = append(b.Middlewares, m)
+	//b.responseMiddlewares = append(b.responseMiddlewares, f)
 }
 
-func (b *Spider) OnResponse(f ResponseMiddlerware) {
-	b.lock.Lock()
-	defer b.lock.Unlock()
-	if f == nil {
-		return
-	}
-	b.responseMiddlewares = append(b.responseMiddlewares, f)
+func (b *Spider) AddMiddleware(m Middleware) {
+	b.Middlewares = append(b.Middlewares, m)
 }
 
-func (b *Spider) getParse() ([]ResponseMiddlerware, ParseFunc) {
+func (b *Spider) getParse() ParseFunc {
 	// 解析 response
-	return b.responseMiddlewares, b.ParseFunc
+	return b.ParseFunc
 }
 
 // 获取爬虫基本信息
@@ -121,34 +136,13 @@ func (b *Spider) pushRequestToSche() RequQueue {
 	return b.RequQueue
 }
 
-// 调度器来调用，加载基本中间件
-func (b *Spider) allBaseMiddlerware(requMs []RequestsMiddlerware, respMs []ResponseMiddlerware) {
-	b.requestsMiddlewares = requMs
-	b.responseMiddlewares = respMs
+func (b *Spider) loadMiddlerwares(ms []Middleware) {
+	b.Middlewares = ms
 }
 
-// 自定义处理 request
-//func (b *Spider) decorationRequests(req *Requests) {
-//	if b.requestsMiddlewares == nil {
-//		return
-//	}
-//	for _, requestsM := range b.requestsMiddlewares {
-//		requestsM(req, nil)
-//	}
-//	return
-//}
-
-// 自定义处理 response
-//func (b *Spider) decorationResponse(resp *Response) {
-//
-//	if b.responseMiddlewares == nil {
-//		return
-//	}
-//	for _, responseM := range b.responseMiddlewares {
-//		responseM(nil, resp)
-//	}
-//	return
-//}
+func (b *Spider) getMiddlerwares() []Middleware {
+	return b.Middlewares
+}
 
 func (b *Spider) GET(u string) (*Requests, error) {
 	return b.NewRequests("GET", u, nil)
